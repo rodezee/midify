@@ -7,58 +7,61 @@ from PIL import Image
 import mido
 from mido import Message, MidiFile, MidiTrack
 
-def get_instrument_by_color(img_rgb):
-    small_img = img_rgb.resize((50, 50))
-    paletted = small_img.convert('P', palette=Image.Palette.ADAPTIVE, colors=4)
-    palette_colors = paletted.getcolors()
-    rgb_palette = paletted.getpalette()
-    
-    dominant_rgb_colors = []
-    if palette_colors and rgb_palette:
-        for count, pixel_value in palette_colors:
-            idx = pixel_value * 3
-            dominant_rgb_colors.append((rgb_palette[idx], rgb_palette[idx+1], rgb_palette[idx+2], count))
-
-    best_r, best_g, best_b = 127, 127, 127
-    highest_vibrancy = -1
-    for r, g, b, count in dominant_rgb_colors:
-        if (r + g + b) < 50 or (r + g + b) > 710: continue
-        vibrancy = max(r, g, b) - min(r, g, b)
-        if vibrancy > highest_vibrancy:
-            highest_vibrancy = vibrancy
-            best_r, best_g, best_b = r, g, b
-
-    if best_r > best_g and best_r > best_b:
-        program = 56 if best_r > 160 else 40
-    elif best_g > best_r and best_g > best_b:
-        program = 73 if best_g > 140 else 68
-    elif best_b > best_r and best_b > best_g:
-        program = 98 if best_b > 150 else 11
-    elif abs(best_r - best_g) < 40 and (best_r + best_g) > 250:
-        program = 24  # Acoustic Nylon Guitar
+def get_note_instrument_channel(r, g, b):
+    """
+    Evaluates a specific note pixel's RGB to dynamically assign 
+    one of 4 dedicated instrument categories and MIDI channels.
+    """
+    # 1. Red Dominant -> Strings / Brass (Channel 1)
+    if r > g and r > b:
+        program = 40 if r < 140 else 56  # Violin vs Trumpet
+        return program, 1
+        
+    # 2. Green Dominant -> Woodwinds / Pipes (Channel 2)
+    elif g > r and g > b:
+        program = 68 if g < 130 else 73  # Oboe vs Flute
+        return program, 2
+        
+    # 3. Blue Dominant -> Ethereal Synthetics / Mallets (Channel 3)
+    elif b > r and b > g:
+        program = 11 if b < 140 else 98  # Vibraphone vs Crystal FX
+        return program, 3
+        
+    # 4. Yellow/Warm/Balanced (Like Sunflower Petals) -> Nylon Guitar (Channel 0)
+    elif abs(r - g) < 45 and (r + g) > 200:
+        return 24, 0  # Acoustic Nylon Guitar
+        
+    # Fallback Neutral (Shadows / Muted Centers) -> Piano (Channel 0)
     else:
-        program = 0
-    return program
+        return 0, 0   # Acoustic Grand Piano
 
 def scale_velocity(raw_val, max_input, min_output, max_output):
     if raw_val <= 0: return min_output
     factor = math.log(raw_val) / math.log(max_input)
     return int(min_output + (max_output - min_output) * min(1.0, factor))
 
-def image_to_midi_with_spaces(image_path, base_bpm, base_note, num_octaves, scale_steps, density, humanize=False):
+def image_to_midi_multi_instrument(image_path, base_bpm, base_note, num_octaves, scale_steps, density, humanize=False):
     img_orig = Image.open(image_path).convert('RGB')
-    selected_program = get_instrument_by_color(img_orig)
-    print(f"🎹 Selected Instrument: Patch #{selected_program}")
-
-    img = img_orig.convert('L').resize((64, 30))
-    width, height = img.size
+    
+    # We maintain a standard reference grayscale version for tracking crisp edge lines
+    img_gray = img_orig.convert('L').resize((64, 30))
+    # Keep an uncompressed RGB canvas matching grid sizes exactly to inspect color tones cleanly
+    img_rgb = img_orig.resize((64, 30))
+    
+    width, height = img_gray.size
 
     mid = MidiFile(type=1)
     melody_track = MidiTrack()
     mid.tracks.append(melody_track)
     
     melody_track.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(base_bpm)))
-    melody_track.append(Message('program_change', program=selected_program, channel=0, time=0))
+    
+    # Initialize our 4 separate channel setups cleanly at tick 0
+    # This presets what instrument family lives on what pathway
+    melody_track.append(Message('program_change', program=24, channel=0, time=0)) # Nylon Guitar / Piano
+    melody_track.append(Message('program_change', program=40, channel=1, time=0)) # Strings / Brass
+    melody_track.append(Message('program_change', program=73, channel=2, time=0)) # Flutes
+    melody_track.append(Message('program_change', program=98, channel=3, time=0)) # Synth Pads
 
     total_intervals = len(scale_steps) * num_octaves
     
@@ -72,8 +75,6 @@ def image_to_midi_with_spaces(image_path, base_bpm, base_note, num_octaves, scal
     timeline_events = {}
     x = 0
     
-    # Dynamic sensitivity calculation based on user density choice
-    # Lower density = higher edge threshold required to spawn a note
     edge_threshold = 45 - (density * 35) 
 
     while x < width:
@@ -81,21 +82,20 @@ def image_to_midi_with_spaces(image_path, base_bpm, base_note, num_octaves, scal
         
         melody_edges = []
         for y in range(height):
-            edge_value = abs(img.getpixel((x, y)) - img.getpixel((x_next, y)))
-            if edge_value > edge_threshold: # Filter weak visual details to leave space
+            edge_value = abs(img_gray.getpixel((x, y)) - img_gray.getpixel((x_next, y)))
+            if edge_value > edge_threshold: 
                 melody_edges.append((y, edge_value))
         
-        # Pull background column properties to calculate length/rests
-        col_pixels = [img.getpixel((x, y)) for y in range(height)]
+        col_pixels = [img_gray.getpixel((x, y)) for y in range(height)]
         avg_col_brightness = sum(col_pixels) / len(col_pixels)
 
-        # Base rhythm timing allocation based on brightness
+        # Space step calculations using brightness parameters
         if avg_col_brightness > 175:
-            step_duration = 4   # Quarter note space allocation
+            step_duration = 4   
         elif avg_col_brightness > 95:
-            step_duration = 2   # Eighth note space allocation
+            step_duration = 2   
         else:
-            step_duration = 1   # Sixteenth note space allocation
+            step_duration = 1   
 
         if x + step_duration > width:
             step_duration = width - x
@@ -109,43 +109,49 @@ def image_to_midi_with_spaces(image_path, base_bpm, base_note, num_octaves, scal
             if humanize:
                 velocity = max(35, min(127, velocity + random.randint(-8, 8)))
 
+            # --- DYNAMIC NOTE-BY-NOTE PIXEL INSPECTION ---
+            # Extract the raw color from the exact coordinate spawning this note!
+            r, g, b = img_rgb.getpixel((x, best_y))
+            
+            # Map that exact pixel color to its dedicated instrument patch and channel
+            program, channel = get_note_instrument_channel(r, g, b)
+
             start_tick = x * STEP_TICKS
             end_tick = (x + step_duration) * STEP_TICKS
-            
-            # Use an 85% note duration so notes ring clearly but don't mesh together
             gate_end_tick = start_tick + int((end_tick - start_tick) * 0.85)
             
-            timeline_events[start_tick] = timeline_events.get(start_tick, []) + [('on', pitch, velocity)]
-            timeline_events[gate_end_tick] = timeline_events.get(gate_end_tick, []) + [('off', pitch, 0)]
-        else:
-            # Explicitly NO note scheduled here! 
-            # This creates a deliberate pause (Rest) across the columns
-            pass
+            # Schedule the events bound tightly to their specific color channel
+            timeline_events[start_tick] = timeline_events.get(start_tick, []) + [('on', pitch, velocity, channel, program)]
+            timeline_events[gate_end_tick] = timeline_events.get(gate_end_tick, []) + [('off', pitch, 0, channel, program)]
 
-        # Increment forward, effectively consuming and clearing the generated space
         x += step_duration
 
-    # Compile timeline ticks to structural sequential delta changes
+    # Compile absolute timeline entries into sequential delta offsets
     last_tick = 0
+    # Store playing tracking states via unique identifiers: (pitch, channel)
     active_playing_notes = set()
 
     for tick in sorted(timeline_events.keys()):
         delta_time = tick - last_tick
         events = timeline_events[tick]
         
-        for event_type, pitch, vel in events:
-            if event_type == 'off' and pitch in active_playing_notes:
-                melody_track.append(Message('note_off', note=pitch, velocity=0, channel=0, time=delta_time))
-                active_playing_notes.remove(pitch)
+        for event_type, pitch, vel, channel, program in events:
+            if event_type == 'off' and (pitch, channel) in active_playing_notes:
+                melody_track.append(Message('note_off', note=pitch, velocity=0, channel=channel, time=delta_time))
+                active_playing_notes.remove((pitch, channel))
                 delta_time = 0
                 
-        for event_type, pitch, vel in events:
+        for event_type, pitch, vel, channel, program in events:
             if event_type == 'on':
-                if pitch in active_playing_notes:
-                    melody_track.append(Message('note_off', note=pitch, velocity=0, channel=0, time=delta_time))
-                    delta_time = 0
-                melody_track.append(Message('note_on', note=pitch, velocity=vel, channel=0, time=delta_time))
-                active_playing_notes.add(pitch)
+                # Real-time patch updates sent explicitly across its destination channel matrix
+                melody_track.append(Message('program_change', program=program, channel=channel, time=delta_time))
+                delta_time = 0
+                
+                if (pitch, channel) in active_playing_notes:
+                    melody_track.append(Message('note_off', note=pitch, velocity=0, channel=channel, time=delta_time))
+                
+                melody_track.append(Message('note_on', note=pitch, velocity=vel, channel=channel, time=delta_time))
+                active_playing_notes.add((pitch, channel))
                 delta_time = 0
                 
         last_tick = tick
@@ -157,23 +163,18 @@ def image_to_midi_with_spaces(image_path, base_bpm, base_note, num_octaves, scal
     return mid
 
 def main():
-    parser = argparse.ArgumentParser(description="Configurable Harmonized Image Synth with Spatial Pauses.")
+    parser = argparse.ArgumentParser(description="Multi-Instrument Note-by-Note Image Synth.")
     parser.add_argument("image", help="Path to image file")
     parser.add_argument("--velocity", choices=["humanize", "default"], default="default")
     parser.add_argument("--tempo", type=int, default=108, help="Tempo (BPM)")
-    parser.add_argument("--base-note", type=int, default=43, help="MIDI note value to start on (Default: 43)")
-    parser.add_argument("--octaves", type=int, default=3, help="Number of octaves to split range (Default: 3)")
-    parser.add_argument("--scale", type=int, nargs='+', default=[0, 2, 4, 7, 9], help="Scale offsets (Default: Pentatonic)")
-    
-    # NEW PAUSE & DENSITY CONTROLLER
-    parser.add_argument("--density", type=float, default=0.45, 
-                        help="Note presence target frequency value from 0.0 (mostly silences) to 1.0 (dense notes). Default is 0.45")
+    parser.add_argument("--base-note", type=int, default=43, help="MIDI base root note (Default: 43)")
+    parser.add_argument("--octaves", type=int, default=3, help="Octave vertical limit range (Default: 3)")
+    parser.add_argument("--scale", type=int, nargs='+', default=[0, 2, 4, 7, 9], help="Scale intervals (Default: Pentatonic)")
+    parser.add_argument("--density", type=float, default=0.40, help="Note appearance target density threshold (Default: 0.40)")
 
     args = parser.parse_args()
     
-    print(f"🎵 Density Setting: {args.density} | Lower numbers make fewer notes and larger pauses.")
-    
-    midi_data = image_to_midi_with_spaces(
+    midi_data = image_to_midi_multi_instrument(
         args.image, 
         base_bpm=args.tempo, 
         base_note=args.base_note,
@@ -183,9 +184,9 @@ def main():
         humanize=(args.velocity == "humanize")
     )
     
-    output_name = os.path.splitext(args.image)[0] + '_spaced_melody.mid'
+    output_name = os.path.splitext(args.image)[0] + '_polychrome.mid'
     midi_data.save(output_name)
-    print(f"🎵 Balanced, spacious 4-measure MIDI successfully saved to: {output_name}")
+    print(f"🎵 Multi-instrument polychrome MIDI successfully saved to: {output_name}")
       
 if __name__ == "__main__":
     main()
