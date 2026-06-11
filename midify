@@ -198,7 +198,7 @@ def main():
         humanize=(args.velocity == "humanize")
     )
     
-    output_name = os.path.splitext(args.image)[0] + '_spaced_melody.mid'
+    output_name = os.path.splitext(args.image)[0] + '.mid'
     midi_data.save(output_name)
     print(f"🎵 Spacious 4-measure MIDI file saved to: {output_name}")
       
