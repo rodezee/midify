@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import random
+import math
+from PIL import Image
+import mido
+from mido import Message, MidiFile, MidiTrack
+
+def get_instrument_by_color(img_rgb):
+    small_img = img_rgb.resize((50, 50))
+    paletted = small_img.convert('P', palette=Image.Palette.ADAPTIVE, colors=4)
+    palette_colors = paletted.getcolors()
+    rgb_palette = paletted.getpalette()
+    
+    dominant_rgb_colors = []
+    if palette_colors and rgb_palette:
+        for count, pixel_value in palette_colors:
+            idx = pixel_value * 3
+            dominant_rgb_colors.append((rgb_palette[idx], rgb_palette[idx+1], rgb_palette[idx+2], count))
+
+    best_r, best_g, best_b = 127, 127, 127
+    highest_vibrancy = -1
+    for r, g, b, count in dominant_rgb_colors:
+        if (r + g + b) < 50 or (r + g + b) > 710: continue
+        vibrancy = max(r, g, b) - min(r, g, b)
+        if vibrancy > highest_vibrancy:
+            highest_vibrancy = vibrancy
+            best_r, best_g, best_b = r, g, b
+
+    if best_r > best_g and best_r > best_b:
+        program = 56 if best_r > 160 else 40
+    elif best_g > best_r and best_g > best_b:
+        program = 73 if best_g > 140 else 68
+    elif best_b > best_r and best_b > best_g:
+        program = 98 if best_b > 150 else 11
+    elif abs(best_r - best_g) < 40 and (best_r + best_g) > 250:
+        program = 24  # Acoustic Nylon Guitar
+    else:
+        program = 0
+    return program
+
+def scale_velocity(raw_val, max_input, min_output, max_output):
+    if raw_val <= 0: return min_output
+    factor = math.log(raw_val) / math.log(max_input)
+    return int(min_output + (max_output - min_output) * min(1.0, factor))
+
+def image_to_midi_with_spaces(image_path, base_bpm, base_note, num_octaves, scale_steps, density, humanize=False):
+    img_orig = Image.open(image_path).convert('RGB')
+    selected_program = get_instrument_by_color(img_orig)
+    print(f"🎹 Selected Instrument: Patch #{selected_program}")
+
+    img = img_orig.convert('L').resize((64, 30))
+    width, height = img.size
+
+    mid = MidiFile(type=1)
+    melody_track = MidiTrack()
+    mid.tracks.append(melody_track)
+    
+    melody_track.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(base_bpm)))
+    melody_track.append(Message('program_change', program=selected_program, channel=0, time=0))
+
+    total_intervals = len(scale_steps) * num_octaves
+    
+    def quantize_to_scale(norm_y):
+        scale_index = int(norm_y * (total_intervals - 1))
+        octave_shift = (scale_index // len(scale_steps)) * 12
+        scale_note = scale_steps[scale_index % len(scale_steps)]
+        return base_note + octave_shift + scale_note
+
+    STEP_TICKS = 120 
+    timeline_events = {}
+    x = 0
+    
+    # Dynamic sensitivity calculation based on user density choice
+    # Lower density = higher edge threshold required to spawn a note
+    edge_threshold = 45 - (density * 35) 
+
+    while x < width:
+        x_next = x - 1 if x == width - 1 else x + 1
+        
+        melody_edges = []
+        for y in range(height):
+            edge_value = abs(img.getpixel((x, y)) - img.getpixel((x_next, y)))
+            if edge_value > edge_threshold: # Filter weak visual details to leave space
+                melody_edges.append((y, edge_value))
+        
+        # Pull background column properties to calculate length/rests
+        col_pixels = [img.getpixel((x, y)) for y in range(height)]
+        avg_col_brightness = sum(col_pixels) / len(col_pixels)
+
+        # Base rhythm timing allocation based on brightness
+        if avg_col_brightness > 175:
+            step_duration = 4   # Quarter note space allocation
+        elif avg_col_brightness > 95:
+            step_duration = 2   # Eighth note space allocation
+        else:
+            step_duration = 1   # Sixteenth note space allocation
+
+        if x + step_duration > width:
+            step_duration = width - x
+
+        if melody_edges:
+            best_y, edge_strength = max(melody_edges, key=lambda item: item[1])
+            norm_y = (height - 1 - best_y) / (height - 1)
+            pitch = quantize_to_scale(norm_y)
+            
+            velocity = scale_velocity(edge_strength, 255, 60, 105)
+            if humanize:
+                velocity = max(35, min(127, velocity + random.randint(-8, 8)))
+
+            start_tick = x * STEP_TICKS
+            end_tick = (x + step_duration) * STEP_TICKS
+            
+            # Use an 85% note duration so notes ring clearly but don't mesh together
+            gate_end_tick = start_tick + int((end_tick - start_tick) * 0.85)
+            
+            timeline_events[start_tick] = timeline_events.get(start_tick, []) + [('on', pitch, velocity)]
+            timeline_events[gate_end_tick] = timeline_events.get(gate_end_tick, []) + [('off', pitch, 0)]
+        else:
+            # Explicitly NO note scheduled here! 
+            # This creates a deliberate pause (Rest) across the columns
+            pass
+
+        # Increment forward, effectively consuming and clearing the generated space
+        x += step_duration
+
+    # Compile timeline ticks to structural sequential delta changes
+    last_tick = 0
+    active_playing_notes = set()
+
+    for tick in sorted(timeline_events.keys()):
+        delta_time = tick - last_tick
+        events = timeline_events[tick]
+        
+        for event_type, pitch, vel in events:
+            if event_type == 'off' and pitch in active_playing_notes:
+                melody_track.append(Message('note_off', note=pitch, velocity=0, channel=0, time=delta_time))
+                active_playing_notes.remove(pitch)
+                delta_time = 0
+                
+        for event_type, pitch, vel in events:
+            if event_type == 'on':
+                if pitch in active_playing_notes:
+                    melody_track.append(Message('note_off', note=pitch, velocity=0, channel=0, time=delta_time))
+                    delta_time = 0
+                melody_track.append(Message('note_on', note=pitch, velocity=vel, channel=0, time=delta_time))
+                active_playing_notes.add(pitch)
+                delta_time = 0
+                
+        last_tick = tick
+
+    final_target_tick = width * STEP_TICKS
+    if last_tick < final_target_tick:
+        melody_track.append(Message('note_off', note=0, velocity=0, channel=0, time=final_target_tick - last_tick))
+
+    return mid
+
+def main():
+    parser = argparse.ArgumentParser(description="Configurable Harmonized Image Synth with Spatial Pauses.")
+    parser.add_argument("image", help="Path to image file")
+    parser.add_argument("--velocity", choices=["humanize", "default"], default="default")
+    parser.add_argument("--tempo", type=int, default=108, help="Tempo (BPM)")
+    parser.add_argument("--base-note", type=int, default=43, help="MIDI note value to start on (Default: 43)")
+    parser.add_argument("--octaves", type=int, default=3, help="Number of octaves to split range (Default: 3)")
+    parser.add_argument("--scale", type=int, nargs='+', default=[0, 2, 4, 7, 9], help="Scale offsets (Default: Pentatonic)")
+    
+    # NEW PAUSE & DENSITY CONTROLLER
+    parser.add_argument("--density", type=float, default=0.45, 
+                        help="Note presence target frequency value from 0.0 (mostly silences) to 1.0 (dense notes). Default is 0.45")
+
+    args = parser.parse_args()
+    
+    print(f"🎵 Density Setting: {args.density} | Lower numbers make fewer notes and larger pauses.")
+    
+    midi_data = image_to_midi_with_spaces(
+        args.image, 
+        base_bpm=args.tempo, 
+        base_note=args.base_note,
+        num_octaves=args.octaves,
+        scale_steps=args.scale,
+        density=args.density,
+        humanize=(args.velocity == "humanize")
+    )
+    
+    output_name = os.path.splitext(args.image)[0] + '_spaced_melody.mid'
+    midi_data.save(output_name)
+    print(f"🎵 Balanced, spacious 4-measure MIDI successfully saved to: {output_name}")
+      
+if __name__ == "__main__":
+    main()
